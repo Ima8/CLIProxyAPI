@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -293,6 +295,70 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
+// antigravityDialer abstracts the underlying TCP connection method so that
+// both SOCKS5 and HTTP CONNECT proxies can be used with the uTLS transport.
+type antigravityDialer interface {
+	Dial(network, addr string) (net.Conn, error)
+}
+
+// directDialer dials directly without any proxy.
+type directDialer struct{}
+
+func (d directDialer) Dial(network, addr string) (net.Conn, error) {
+	return net.DialTimeout(network, addr, 30*time.Second)
+}
+
+// httpConnectDialer tunnels through an HTTP proxy using the CONNECT method.
+type httpConnectDialer struct {
+	proxyAddr string
+	proxyAuth string // "user:pass" or empty
+}
+
+func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", d.proxyAddr, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial proxy %s: %w", d.proxyAddr, err)
+	}
+
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+	if d.proxyAuth != "" {
+		connectReq += "Proxy-Authorization: Basic " + base64Encode(d.proxyAuth) + "\r\n"
+	}
+	connectReq += "\r\n"
+
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write CONNECT: %w", err)
+	}
+
+	// Read the proxy response (just need the status line)
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read CONNECT response: %w", err)
+	}
+
+	// Drain remaining headers
+	for {
+		line, errLine := br.ReadString('\n')
+		if errLine != nil || strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	if !strings.Contains(statusLine, "200") {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(statusLine))
+	}
+
+	return conn, nil
+}
+
+func base64Encode(s string) string {
+	return base64.StdEncoding.EncodeToString([]byte(s))
+}
+
 // utlsAntigravityRoundTripper implements http.RoundTripper using utls with Chrome
 // fingerprint to match the TLS fingerprint of the official Antigravity IDE client
 // (Node.js on macOS). It negotiates HTTP/2 via ALPN and pools connections per host.
@@ -300,21 +366,37 @@ type utlsAntigravityRoundTripper struct {
 	mu          sync.Mutex
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
-	dialer      proxy.Dialer
+	dialer      antigravityDialer
 }
 
 func newUtlsAntigravityRoundTripper(proxyURL string) *utlsAntigravityRoundTripper {
-	var dialer proxy.Dialer = proxy.Direct
+	var dialer antigravityDialer = directDialer{}
 	if proxyURL != "" {
 		parsed, err := url.Parse(proxyURL)
 		if err != nil {
 			log.Errorf("antigravity utls: failed to parse proxy URL %q: %v", proxyURL, err)
 		} else {
-			pDialer, err := proxy.FromURL(parsed, proxy.Direct)
-			if err != nil {
-				log.Errorf("antigravity utls: failed to create proxy dialer for %q: %v", proxyURL, err)
-			} else {
-				dialer = pDialer
+			switch parsed.Scheme {
+			case "socks5":
+				// SOCKS5 proxy — use golang.org/x/net/proxy
+				pDialer, errSOCKS := proxy.FromURL(parsed, proxy.Direct)
+				if errSOCKS != nil {
+					log.Errorf("antigravity utls: failed to create SOCKS5 dialer for %q: %v", proxyURL, errSOCKS)
+				} else {
+					dialer = pDialer
+				}
+			case "http", "https":
+				// HTTP CONNECT proxy — tunnel TCP through proxy
+				proxyAuth := ""
+				if parsed.User != nil {
+					proxyAuth = parsed.User.String()
+				}
+				dialer = &httpConnectDialer{
+					proxyAddr: parsed.Host,
+					proxyAuth: proxyAuth,
+				}
+			default:
+				log.Errorf("antigravity utls: unsupported proxy scheme %q", parsed.Scheme)
 			}
 		}
 	}
