@@ -17,12 +17,15 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -44,23 +47,46 @@ const (
 	antigravityStreamPath          = "/v1internal:streamGenerateContent"
 	antigravityGeneratePath        = "/v1internal:generateContent"
 	antigravityModelsPath          = "/v1internal:fetchAvailableModels"
+	antigravityLoadCodeAssistPath  = "/v1internal:loadCodeAssist"
+	antigravityMetricsPath         = "/v1internal:recordCodeAssistMetrics"
 	antigravityClientID            = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	antigravityClientSecret        = "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"
-	defaultAntigravityAgent        = "antigravity/1.19.6 darwin/arm64"
+	defaultAntigravityVersion      = "1.19.6"
 	antigravityAuthType            = "antigravity"
 	refreshSkew                    = 3000 * time.Second
-	// systemInstruction              = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"
+	antigravityVersionRefreshInterval = 6 * time.Hour
+	antigravityNpmRegistryURL      = "https://registry.npmjs.org/antigravity/latest"
 )
 
 var (
 	randSource      = rand.New(rand.NewSource(time.Now().UnixNano()))
 	randSourceMutex sync.Mutex
+
 	// antigravityPrimaryModelsCache keeps the latest non-empty model list fetched
 	// from any antigravity auth. Empty fetches never overwrite this cache.
 	antigravityPrimaryModelsCache struct {
 		mu     sync.RWMutex
 		models []*registry.ModelInfo
 	}
+
+	// antigravityVersion holds the dynamically resolved version string.
+	antigravityVersion struct {
+		mu      sync.RWMutex
+		version string
+		once    sync.Once
+	}
+
+	// antigravityMachineID is a stable per-installation identifier.
+	antigravityMachineID struct {
+		once sync.Once
+		id   string
+	}
+
+	// antigravitySessionID is generated once per process lifetime.
+	antigravitySessionID = uuid.NewString()
+
+	// antigravityBootstrapOnce ensures session bootstrap runs once per process.
+	antigravityBootstrapOnce sync.Once
 )
 
 func cloneAntigravityModels(models []*registry.ModelInfo) []*registry.ModelInfo {
@@ -127,12 +153,132 @@ func fallbackAntigravityPrimaryModels() []*registry.ModelInfo {
 	return models
 }
 
+// getAntigravityVersion returns the current dynamically-resolved version,
+// falling back to the hardcoded default.
+func getAntigravityVersion() string {
+	antigravityVersion.mu.RLock()
+	v := antigravityVersion.version
+	antigravityVersion.mu.RUnlock()
+	if v != "" {
+		return v
+	}
+	return defaultAntigravityVersion
+}
+
+// defaultAntigravityAgent returns the user-agent string with dynamic version.
+// Always reports darwin/arm64 to match the official Antigravity IDE client fingerprint.
+func defaultAntigravityAgent() string {
+	return "antigravity/" + getAntigravityVersion() + " darwin/arm64"
+}
+
+// startAntigravityVersionRefresh fetches the latest version synchronously on
+// first call (so the very first request already has it), then launches a
+// background goroutine that refreshes every 6 hours.
+func startAntigravityVersionRefresh() {
+	antigravityVersion.once.Do(func() {
+		// Synchronous fetch so the first request already has the resolved version.
+		fetchAntigravityLatestVersion()
+
+		// Periodic refresh in the background.
+		go func() {
+			ticker := time.NewTicker(antigravityVersionRefreshInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchAntigravityLatestVersion()
+			}
+		}()
+	})
+}
+
+// fetchAntigravityLatestVersion queries the npm registry for the latest version.
+func fetchAntigravityLatestVersion() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, antigravityNpmRegistryURL, nil)
+	if err != nil {
+		log.Debugf("antigravity version fetch: create request error: %v", err)
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Debugf("antigravity version fetch: request error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Debugf("antigravity version fetch: unexpected status %d", resp.StatusCode)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+	if err != nil {
+		log.Debugf("antigravity version fetch: read error: %v", err)
+		return
+	}
+
+	version := gjson.GetBytes(body, "version").String()
+	if version == "" {
+		log.Debug("antigravity version fetch: no version field in response")
+		return
+	}
+
+	antigravityVersion.mu.Lock()
+	antigravityVersion.version = version
+	antigravityVersion.mu.Unlock()
+	log.Debugf("antigravity version fetch: resolved version %s", version)
+}
+
+// getAntigravityMachineID returns a stable per-installation machine identifier.
+// It persists the ID to ~/.cliproxy/machine-id so it survives restarts.
+func getAntigravityMachineID() string {
+	antigravityMachineID.once.Do(func() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			antigravityMachineID.id = uuid.NewString()
+			return
+		}
+		dir := filepath.Join(home, ".cliproxy")
+		idFile := filepath.Join(dir, "machine-id")
+
+		data, err := os.ReadFile(idFile)
+		if err == nil {
+			id := strings.TrimSpace(string(data))
+			if id != "" {
+				antigravityMachineID.id = id
+				return
+			}
+		}
+
+		id := uuid.NewString()
+		_ = os.MkdirAll(dir, 0700)
+		_ = os.WriteFile(idFile, []byte(id), 0600)
+		antigravityMachineID.id = id
+	})
+	return antigravityMachineID.id
+}
+
+// getAntigravitySessionID returns the per-process session identifier.
+func getAntigravitySessionID() string {
+	return antigravitySessionID
+}
+
+// antigravityClientMetadata returns the Client-Metadata JSON header value
+// with the current dynamic version.
+func antigravityClientMetadata() string {
+	return fmt.Sprintf(`{"ideType":"ANTIGRAVITY","ideVersion":"%s","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`, getAntigravityVersion())
+}
+
 // AntigravityExecutor proxies requests to the antigravity upstream.
 type AntigravityExecutor struct {
 	cfg *config.Config
 }
 
 // NewAntigravityExecutor creates a new Antigravity executor instance.
+// It also starts the background version refresh goroutine on first call.
 //
 // Parameters:
 //   - cfg: The application configuration
@@ -140,6 +286,7 @@ type AntigravityExecutor struct {
 // Returns:
 //   - *AntigravityExecutor: A new Antigravity executor instance
 func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
+	startAntigravityVersionRefresh()
 	return &AntigravityExecutor{cfg: cfg}
 }
 
@@ -246,6 +393,9 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
 	httpReq.Close = true // sends Connection: close
 
+	// Add Antigravity client identification headers
+	setAntigravityClientHeaders(httpReq)
+
 	// Inject Authorization: Bearer <token>
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
@@ -257,6 +407,8 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 
 // Execute performs a non-streaming request to the Antigravity API.
 func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	e.antigravitySessionBootstrap(ctx, auth)
+
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -382,6 +534,7 @@ attemptLoop:
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
 			resp = cliproxyexecutor.Response{Payload: []byte(converted), Headers: httpResp.Header.Clone()}
 			reporter.ensurePublished(ctx)
+			e.recordCodeAssistMetrics(ctx, auth, token, baseModel)
 			return resp, nil
 		}
 
@@ -586,6 +739,7 @@ attemptLoop:
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, resp.Payload, &param)
 			resp = cliproxyexecutor.Response{Payload: []byte(converted), Headers: httpResp.Header.Clone()}
 			reporter.ensurePublished(ctx)
+			e.recordCodeAssistMetrics(ctx, auth, token, baseModel)
 
 			return resp, nil
 		}
@@ -794,6 +948,8 @@ func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 
 // ExecuteStream performs a streaming request to the Antigravity API.
 func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	e.antigravitySessionBootstrap(ctx, auth)
+
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -965,6 +1121,7 @@ attemptLoop:
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
 				} else {
 					reporter.ensurePublished(ctx)
+					e.recordCodeAssistMetrics(ctx, auth, token, baseModel)
 				}
 			}(httpResp)
 			return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -1069,6 +1226,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		setAntigravityClientHeaders(httpReq)
 		if host := resolveHost(base); host != "" {
 			httpReq.Host = host
 		}
@@ -1185,6 +1343,7 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		setAntigravityClientHeaders(httpReq)
 		if host := resolveHost(baseURL); host != "" {
 			httpReq.Host = host
 		}
@@ -1528,6 +1687,9 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		httpReq.Host = host
 	}
 
+	// Add Antigravity client identification headers
+	setAntigravityClientHeaders(httpReq)
+
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1642,7 +1804,7 @@ func resolveUserAgent(auth *cliproxyauth.Auth) string {
 			}
 		}
 	}
-	return defaultAntigravityAgent
+	return defaultAntigravityAgent()
 }
 
 func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
@@ -1706,9 +1868,9 @@ func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
 		return []string{base}
 	}
 	return []string{
+		antigravityBaseURLProd,
 		antigravityBaseURLDaily,
 		antigravitySandboxBaseURLDaily,
-		// antigravityBaseURLProd,
 	}
 }
 
@@ -1809,4 +1971,135 @@ func generateProjectID() string {
 	randSourceMutex.Unlock()
 	randomPart := strings.ToLower(uuid.NewString())[:5]
 	return adj + "-" + noun + "-" + randomPart
+}
+
+// setAntigravityClientHeaders adds the Antigravity client identification headers
+// to the given HTTP request to match the official IDE client behavior.
+func setAntigravityClientHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("X-Client-Name", "antigravity")
+	req.Header.Set("X-Client-Version", getAntigravityVersion())
+	req.Header.Set("x-goog-api-client", "gl-node/18.18.2 fire/0.8.6 grpc/1.10.x")
+	req.Header.Set("Client-Metadata", antigravityClientMetadata())
+	req.Header.Set("X-Machine-Id", getAntigravityMachineID())
+	req.Header.Set("X-Machine-Session-Id", getAntigravitySessionID())
+}
+
+// antigravitySessionBootstrap performs the one-time session startup calls:
+// loadCodeAssist and fetchAvailableModels. This is called once per executor
+// lifetime to match the official client's boot behavior.
+func (e *AntigravityExecutor) antigravitySessionBootstrap(ctx context.Context, auth *cliproxyauth.Auth) {
+	antigravityBootstrapOnce.Do(func() {
+		go func() {
+			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			// loadCodeAssist at runtime (not just auth time)
+			token, updatedAuth, err := e.ensureAccessToken(bootstrapCtx, auth)
+			if err != nil || token == "" {
+				log.Debugf("antigravity bootstrap: skipped (no token): %v", err)
+				return
+			}
+			if updatedAuth != nil {
+				auth = updatedAuth
+			}
+
+			e.callLoadCodeAssist(bootstrapCtx, auth, token)
+
+			// Fetch available models at boot
+			_ = FetchAntigravityModels(bootstrapCtx, auth, e.cfg)
+			log.Debug("antigravity bootstrap: session bootstrap completed")
+		}()
+	})
+}
+
+// callLoadCodeAssist calls the loadCodeAssist endpoint for session initialization.
+func (e *AntigravityExecutor) callLoadCodeAssist(ctx context.Context, auth *cliproxyauth.Auth, token string) {
+	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	if len(baseURLs) == 0 {
+		return
+	}
+
+	body := []byte(fmt.Sprintf(`{"metadata":%s}`, antigravity.ClientMetadata))
+
+	for _, baseURL := range baseURLs {
+		reqURL := strings.TrimSuffix(baseURL, "/") + antigravityLoadCodeAssistPath
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		httpReq.Close = true
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		setAntigravityClientHeaders(httpReq)
+		if host := resolveHost(baseURL); host != "" {
+			httpReq.Host = host
+		}
+
+		httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
+		resp, err := httpClient.Do(httpReq)
+		if err != nil {
+			log.Debugf("antigravity bootstrap: loadCodeAssist error on %s: %v", baseURL, err)
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			log.Debug("antigravity bootstrap: loadCodeAssist succeeded")
+			return
+		}
+		log.Debugf("antigravity bootstrap: loadCodeAssist status %d on %s", resp.StatusCode, baseURL)
+	}
+}
+
+// recordCodeAssistMetrics sends a metrics event after a successful LLM response.
+func (e *AntigravityExecutor) recordCodeAssistMetrics(ctx context.Context, auth *cliproxyauth.Auth, token, model string) {
+	if token == "" {
+		return
+	}
+	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	if len(baseURLs) == 0 {
+		return
+	}
+
+	metricsBody := fmt.Sprintf(`{"model":"%s","metadata":%s}`, model, antigravity.ClientMetadata)
+
+	go func() {
+		metricsCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		for _, baseURL := range baseURLs {
+			reqURL := strings.TrimSuffix(baseURL, "/") + antigravityMetricsPath
+
+			httpReq, err := http.NewRequestWithContext(metricsCtx, http.MethodPost, reqURL, strings.NewReader(metricsBody))
+			if err != nil {
+				continue
+			}
+			httpReq.Close = true
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Authorization", "Bearer "+token)
+			httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+			setAntigravityClientHeaders(httpReq)
+			if host := resolveHost(baseURL); host != "" {
+				httpReq.Host = host
+			}
+
+			httpClient := newAntigravityHTTPClient(metricsCtx, e.cfg, auth, 0)
+			resp, err := httpClient.Do(httpReq)
+			if err != nil {
+				continue
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+				return
+			}
+		}
+	}()
 }

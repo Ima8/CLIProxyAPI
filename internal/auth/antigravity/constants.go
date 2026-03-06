@@ -30,5 +30,5 @@ const (
 	APIVersion     = "v1internal"
 	APIUserAgent   = "google-api-nodejs-client/9.15.1"
 	APIClient      = "google-cloud-sdk vscode_cloudshelleditor/0.1"
-	ClientMetadata = `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`
+	ClientMetadata = `{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`
 )
