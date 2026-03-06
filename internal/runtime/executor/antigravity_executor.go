@@ -8,8 +8,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -37,6 +38,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -290,60 +293,167 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
-// antigravityTransport is a singleton HTTP/1.1 transport shared by all Antigravity requests.
-// It is initialized once via antigravityTransportOnce to avoid leaking a new connection pool
-// (and the goroutines managing it) on every request.
+// utlsAntigravityRoundTripper implements http.RoundTripper using utls with Chrome
+// fingerprint to match the TLS fingerprint of the official Antigravity IDE client
+// (Node.js on macOS). It negotiates HTTP/2 via ALPN and pools connections per host.
+type utlsAntigravityRoundTripper struct {
+	mu          sync.Mutex
+	connections map[string]*http2.ClientConn
+	pending     map[string]*sync.Cond
+	dialer      proxy.Dialer
+}
+
+func newUtlsAntigravityRoundTripper(proxyURL string) *utlsAntigravityRoundTripper {
+	var dialer proxy.Dialer = proxy.Direct
+	if proxyURL != "" {
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
+			log.Errorf("antigravity utls: failed to parse proxy URL %q: %v", proxyURL, err)
+		} else {
+			pDialer, err := proxy.FromURL(parsed, proxy.Direct)
+			if err != nil {
+				log.Errorf("antigravity utls: failed to create proxy dialer for %q: %v", proxyURL, err)
+			} else {
+				dialer = pDialer
+			}
+		}
+	}
+	return &utlsAntigravityRoundTripper{
+		connections: make(map[string]*http2.ClientConn),
+		pending:     make(map[string]*sync.Cond),
+		dialer:      dialer,
+	}
+}
+
+func (t *utlsAntigravityRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
+	t.mu.Lock()
+
+	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
+		t.mu.Unlock()
+		return h2Conn, nil
+	}
+
+	if cond, ok := t.pending[host]; ok {
+		cond.Wait()
+		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
+			t.mu.Unlock()
+			return h2Conn, nil
+		}
+	}
+
+	cond := sync.NewCond(&t.mu)
+	t.pending[host] = cond
+	t.mu.Unlock()
+
+	h2Conn, err := t.createConnection(host, addr)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	delete(t.pending, host)
+	cond.Broadcast()
+
+	if err != nil {
+		return nil, err
+	}
+
+	t.connections[host] = h2Conn
+	return h2Conn, nil
+}
+
+func (t *utlsAntigravityRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
+	conn, err := t.dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig := &tls.Config{ServerName: host}
+	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+
+	if err := tlsConn.Handshake(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	tr := &http2.Transport{}
+	h2Conn, err := tr.NewClientConn(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+
+	return h2Conn, nil
+}
+
+func (t *utlsAntigravityRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Host
+	addr := host
+	if !strings.Contains(addr, ":") {
+		addr += ":443"
+	}
+	hostname := req.URL.Hostname()
+
+	h2Conn, err := t.getOrCreateConnection(hostname, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := h2Conn.RoundTrip(req)
+	if err != nil {
+		t.mu.Lock()
+		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
+			delete(t.connections, hostname)
+		}
+		t.mu.Unlock()
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// antigravityUTLSTransport is a singleton uTLS round tripper shared by all
+// Antigravity requests when no proxy is configured.
 var (
-	antigravityTransport     *http.Transport
-	antigravityTransportOnce sync.Once
+	antigravityUTLSTransport     *utlsAntigravityRoundTripper
+	antigravityUTLSTransportOnce sync.Once
 )
 
-func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
-	if base == nil {
-		return nil
-	}
-
-	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = false
-	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
-	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
-	if clone.TLSClientConfig == nil {
-		clone.TLSClientConfig = &tls.Config{}
-	} else {
-		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
-	}
-	// Actively advertise only HTTP/1.1 in the ALPN handshake.
-	clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	return clone
-}
-
-// initAntigravityTransport creates the shared HTTP/1.1 transport exactly once.
-func initAntigravityTransport() {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		base = &http.Transport{}
-	}
-	antigravityTransport = cloneTransportWithHTTP11(base)
-}
-
-// newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
-// enforcing HTTP/1.1 by disabling HTTP/2 to perfectly mimic Node.js https defaults.
-// The underlying Transport is a singleton to avoid leaking connection pools.
+// newAntigravityHTTPClient creates an HTTP client for Antigravity using uTLS
+// with Chrome fingerprint and HTTP/2, matching the official IDE client's
+// TLS and protocol behavior.
 func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	antigravityTransportOnce.Do(initAntigravityTransport)
-
-	client := newProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-	// If no transport is set, use the shared HTTP/1.1 transport.
-	if client.Transport == nil {
-		client.Transport = antigravityTransport
-		return client
+	httpClient := &http.Client{}
+	if timeout > 0 {
+		httpClient.Timeout = timeout
 	}
 
-	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
+	// Resolve proxy URL (auth > cfg priority)
+	var proxyURL string
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
-	return client
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	if proxyURL != "" {
+		// Per-proxy uTLS transport (not cached — proxies are rare)
+		httpClient.Transport = newUtlsAntigravityRoundTripper(proxyURL)
+		return httpClient
+	}
+
+	// Check for context round tripper (e.g. from RoundTripperFor)
+	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+		httpClient.Transport = rt
+		return httpClient
+	}
+
+	// Default: shared uTLS singleton (no proxy)
+	antigravityUTLSTransportOnce.Do(func() {
+		antigravityUTLSTransport = newUtlsAntigravityRoundTripper("")
+	})
+	httpClient.Transport = antigravityUTLSTransport
+	return httpClient
 }
 
 // Identifier returns the executor identifier.
@@ -391,7 +501,6 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	}
 	// Content-Length is managed automatically by Go's http.Client from the Body
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
-	httpReq.Close = true // sends Connection: close
 
 	// Add Antigravity client identification headers
 	setAntigravityClientHeaders(httpReq)
@@ -1222,7 +1331,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		if errReq != nil {
 			return cliproxyexecutor.Response{}, errReq
 		}
-		httpReq.Close = true
+
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -1339,7 +1448,7 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		if errReq != nil {
 			return fallbackAntigravityPrimaryModels()
 		}
-		httpReq.Close = true
+
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -1514,8 +1623,8 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	}
 	httpReq.Header.Set("Host", "oauth2.googleapis.com")
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// Real Antigravity uses Go's default User-Agent for OAuth token refresh
-	httpReq.Header.Set("User-Agent", "Go-http-client/2.0")
+	// Match the official Antigravity client's OAuth User-Agent
+	httpReq.Header.Set("User-Agent", antigravity.APIUserAgent)
 
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, errDo := httpClient.Do(httpReq)
@@ -1679,7 +1788,6 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	if errReq != nil {
 		return nil, errReq
 	}
-	httpReq.Close = true
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -1963,14 +2071,14 @@ func generateStableSessionID(payload []byte) string {
 }
 
 func generateProjectID() string {
-	adjectives := []string{"useful", "bright", "swift", "calm", "bold"}
-	nouns := []string{"fuze", "wave", "spark", "flow", "core"}
+	// Generate a project ID matching the GCP free-tier format: gen-lang-client-<12 hex chars>
+	b := make([]byte, 6)
 	randSourceMutex.Lock()
-	adj := adjectives[randSource.Intn(len(adjectives))]
-	noun := nouns[randSource.Intn(len(nouns))]
+	for i := range b {
+		b[i] = byte(randSource.Intn(256))
+	}
 	randSourceMutex.Unlock()
-	randomPart := strings.ToLower(uuid.NewString())[:5]
-	return adj + "-" + noun + "-" + randomPart
+	return "gen-lang-client-" + hex.EncodeToString(b)
 }
 
 // setAntigravityClientHeaders adds the Antigravity client identification headers
@@ -2031,7 +2139,7 @@ func (e *AntigravityExecutor) callLoadCodeAssist(ctx context.Context, auth *clip
 		if err != nil {
 			continue
 		}
-		httpReq.Close = true
+
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -2046,10 +2154,29 @@ func (e *AntigravityExecutor) callLoadCodeAssist(ctx context.Context, auth *clip
 			log.Debugf("antigravity bootstrap: loadCodeAssist error on %s: %v", baseURL, err)
 			continue
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
+		bodyBytes, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 
 		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			// Extract project_id from response if not already known
+			if auth != nil && auth.Metadata != nil && auth.Metadata["project_id"] == nil && len(bodyBytes) > 0 {
+				var loadResp map[string]any
+				if errJSON := json.Unmarshal(bodyBytes, &loadResp); errJSON == nil {
+					var projectID string
+					switch v := loadResp["cloudaicompanionProject"].(type) {
+					case string:
+						projectID = strings.TrimSpace(v)
+					case map[string]any:
+						if id, ok := v["id"].(string); ok {
+							projectID = strings.TrimSpace(id)
+						}
+					}
+					if projectID != "" {
+						auth.Metadata["project_id"] = projectID
+						log.Debugf("antigravity bootstrap: extracted project_id from loadCodeAssist: %s", projectID)
+					}
+				}
+			}
 			log.Debug("antigravity bootstrap: loadCodeAssist succeeded")
 			return
 		}
@@ -2080,7 +2207,7 @@ func (e *AntigravityExecutor) recordCodeAssistMetrics(ctx context.Context, auth 
 			if err != nil {
 				continue
 			}
-			httpReq.Close = true
+	
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set("Authorization", "Bearer "+token)
 			httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
